@@ -12,10 +12,15 @@ export default {
       return new Response("Method not allowed", { status: 405 });
     }
 
+    const MAX_DURATION_MS = 5 * 60 * 1000; // safety valve for a stuck/abusive connection — well above any sane -dt
+    const started = Date.now();
     const chunk = new Uint8Array(64 * 1024);
     const stream = new ReadableStream({
       pull(controller) {
-        controller.enqueue(chunk); // never closes on its own — client's -dt timeout is what ends it
+        if (Date.now() - started > MAX_DURATION_MS) {
+          return controller.close();
+        }
+        controller.enqueue(chunk); // otherwise never closes on its own — client's -dt timeout is what ends it
       },
     });
 
