@@ -111,6 +111,73 @@ real access control:
   the hardcoded Chrome `User-Agent` it sends) independently of anything you
   configured.
 
+## Running from behind a transparent proxy (OpenWrt / Passwall)
+
+If you're running `CloudflareSpeedTest` directly on a router that transparently
+proxies its own traffic (e.g. OpenWrt with Passwall/Xray-core, where "proxy the
+router itself" is on), the speed test measures your proxy's path instead of
+your real WAN — usually not what you want. On OpenWrt's `nftables`/`fw4`
+firewall, the most surgical fix is a UID-based exception so only the speed
+test process bypasses the proxy, leaving everything else on the router
+(and all LAN clients) unaffected:
+
+1. **Create a dedicated user** to run the speed test as, so there's a stable
+   UID to match on:
+   ```sh
+   opkg update && opkg install shadow-useradd
+   useradd -M -s /bin/false speedtest
+   id -u speedtest   # note this UID
+   ```
+2. **Find where your proxy actually intercepts local traffic.** Don't assume —
+   inspect it:
+   ```sh
+   nft list ruleset | grep -B2 -A6 'hook output'
+   ```
+   Look for a `type nat hook output` (or `type route hook output`) chain that
+   jumps into a proxy-managed chain (Passwall's is typically named something
+   like `PSW_OUTPUT_NAT`/`PSW_OUTPUT_MANGLE`) ending in a `redirect to :<port>`
+   or `tproxy ip to :<port>`. **A plain early `accept` verdict for your UID is
+   not enough** — `accept` in one base chain only finishes *that* chain; it
+   doesn't skip other independently-registered chains at the same hook, so a
+   separately-registered NAT-type chain still runs afterward and can still
+   redirect the packet. What actually works is checking whether that chain
+   already has a built-in bypass convention — Passwall's does, in the form of
+   a sentinel packet mark it explicitly checks and returns early on:
+   ```
+   meta mark 0x000000ff ... return
+   ```
+   (search for `0x000000ff` or `0xff` in your ruleset near the redirect rule —
+   the exact value and chain names can differ by proxy suite/version, so
+   confirm against your own output rather than assuming).
+3. **Set that same mark for your dedicated UID, early enough to run before the
+   proxy's chain** (priority `raw` is early enough for most setups):
+   ```sh
+   cat > /etc/nftables.d/95-speedtest-bypass.nft <<'EOF'
+   chain speedtest_bypass_output {
+       type filter hook output priority raw; policy accept;
+       meta skuid <UID> meta mark set 0x000000ff accept
+   }
+   EOF
+   /etc/init.d/firewall reload
+   ```
+   This file gets spliced into `table inet fw4` on every firewall reload (note
+   it's a bare `chain` block, no `table` wrapper — that would be a syntax
+   error, since it's inserted inside fw4's own table), so it survives reboots
+   and proxy service restarts without depending on their dynamically-generated
+   chain names.
+4. **Run the test as that user:**
+   ```sh
+   su speedtest -c "CloudflareSpeedTest -url \"https://<your-domain>/<your-secret>\" -debug"
+   ```
+5. **Verify it's actually bypassing** — compare egress (e.g. `curl
+   https://cloudflare.com/cdn-cgi/trace`) as the `speedtest` user vs. as
+   another user; they should show different exit paths.
+
+If your proxy suite doesn't expose an equivalent bypass-mark convention, the
+same UID-matching principle still applies — you'd instead need a competing,
+higher-precedence `ip rule` (`ip rule list` to see what your proxy already
+installed) rather than an nftables mark.
+
 ## Local development (optional, instead of the button)
 
 ```bash
