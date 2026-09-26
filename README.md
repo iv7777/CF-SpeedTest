@@ -58,6 +58,15 @@ This prints a complete URL, e.g. `https://speedtest.example.com/1790416074-3f9c�
 signature over it. Anyone who captures one of these URLs only gets a window
 until it expires; it can't be reused or extended without your `SIGNING_KEY`.
 
+**The TTL is a client-side choice, but the Worker independently caps it at
+120 minutes** (`MAX_TTL_SECONDS` in `src/index.js`) — a token requesting a
+longer window is rejected outright, regardless of whether its signature is
+otherwise valid. Without this, the script's TTL argument would be pure
+convention: nothing server-side would stop a token from being minted with an
+effectively permanent expiry. The cap means even a mistakenly huge TTL, or a
+worst case where `SIGNING_KEY` itself ever leaked, is bounded to at most a
+120-minute window rather than unlimited.
+
 ## Use it with CloudflareSpeedTest
 
 Generate a URL right before you run the test (see above), then:
@@ -65,7 +74,8 @@ Generate a URL right before you run the test (see above), then:
 CloudflareSpeedTest -url "$(SPEEDTEST_SIGNING_KEY="..." ./scripts/gen-url.sh <your-domain> 600)" -debug
 ```
 If the test run (ping phase + download phase) might take longer than the
-default 10-minute window, pass a larger TTL as the second argument.
+default 10-minute window, pass a larger TTL as the second argument (up to
+120 minutes — see the cap noted above).
 
 ## Optional: fixed-size test files, for manual spot-checks only
 

@@ -8,12 +8,16 @@ function hexToBytes(hex) {
 
 // token format: "<unix-expiry>-<hex hmac-sha256 of the expiry, signed with env.SIGNING_KEY>"
 // generated fresh per use by scripts/gen-url.sh — nothing here is a static, reusable secret.
+const MAX_TTL_SECONDS = 120 * 60; // hard cap, enforced independently of the signature — see README
+
 async function verifyToken(token, key) {
   const match = /^([0-9]+)-([0-9a-f]{64})$/i.exec(token || "");
   if (!match) return false;
   const [, expStr, sigHex] = match;
   const exp = parseInt(expStr, 10);
-  if (!Number.isFinite(exp) || Date.now() / 1000 >= exp) return false; // expired
+  const now = Date.now() / 1000;
+  if (!Number.isFinite(exp) || exp <= now) return false; // expired
+  if (exp - now > MAX_TTL_SECONDS) return false; // requested window too far out — reject even if the signature is otherwise valid
 
   const cryptoKey = await crypto.subtle.importKey(
     "raw",
