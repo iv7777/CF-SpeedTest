@@ -1,10 +1,42 @@
+function hexToBytes(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+  }
+  return bytes;
+}
+
+// token format: "<unix-expiry>-<hex hmac-sha256 of the expiry, signed with env.SIGNING_KEY>"
+// generated fresh per use by scripts/gen-url.sh — nothing here is a static, reusable secret.
+async function verifyToken(token, key) {
+  const match = /^([0-9]+)-([0-9a-f]{64})$/i.exec(token || "");
+  if (!match) return false;
+  const [, expStr, sigHex] = match;
+  const exp = parseInt(expStr, 10);
+  if (!Number.isFinite(exp) || Date.now() / 1000 >= exp) return false; // expired
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(key),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+  return crypto.subtle.verify(
+    "HMAC",
+    cryptoKey,
+    hexToBytes(sigHex),
+    new TextEncoder().encode(expStr)
+  );
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // --- auth: only requests carrying the secret path segment proceed ---
+    // --- auth: only requests carrying a currently-valid signed token proceed ---
     const parts = url.pathname.split("/").filter(Boolean);
-    if (parts[0] !== env.SPEEDTEST_SECRET) {
+    if (!(await verifyToken(parts[0], env.SIGNING_KEY))) {
       return new Response("Not found", { status: 404 }); // 404, not 403 — don't confirm the path exists
     }
 
@@ -13,7 +45,7 @@ export default {
     }
 
     // optional fixed size via a second path segment, e.g. /50m.test, /100m.test, /1g.test
-    // — for manual spot-checks only; leave this off (bare secret path) for CloudflareSpeedTest's -url,
+    // — for manual spot-checks only; leave this off (bare token path) for CloudflareSpeedTest's -url,
     // since a size small enough to finish before -dt elapses reintroduces the "finished early" EWMA bug.
     let sizeBytes = null;
     const sizeMatch = parts[1]?.match(/^(\d+(?:\.\d+)?)(k|m|g)b?(?:\.test)?$/i);

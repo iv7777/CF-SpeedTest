@@ -2,8 +2,10 @@
 
 A Cloudflare Worker that serves a byte stream for use as the `-url` target of
 [XIU2/CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest), gated
-behind a secret path segment so only requests that know the secret get a
-response — everything else gets a plain `404`.
+behind a short-lived, HMAC-signed token so only a freshly-generated URL works
+— everything else (including an old URL whose window has lapsed) gets a plain
+`404`. There's no static secret sitting in a URL forever; each test URL is
+generated on demand and expires on its own shortly after.
 
 ## Deploy
 
@@ -18,32 +20,44 @@ source correctly. The reliable fallback is to paste [`src/index.js`](src/index.j
 directly: Cloudflare dashboard → **Workers & Pages** → your worker →
 **Edit code** (Quick Edit) → replace the contents → **Save and deploy**.
 
-## After deploying: set the secret
+## After deploying: set the signing key
 
-The Worker checks the first path segment of every request against the
-`SPEEDTEST_SECRET` environment variable/secret. It is **not** set in this repo
+The Worker validates the first path segment as `<unix-expiry>-<hmac-sha256-hex>`,
+verified against the `SIGNING_KEY` secret. It is **not** set in this repo
 (it's public), so you must set it yourself after deploying:
 
 1. Cloudflare dashboard → **Workers & Pages** → your worker → **Settings → Variables and Secrets**
-2. Add a variable named `SPEEDTEST_SECRET`, type **Secret**, value of your choosing.
-   Whatever you pick, it must match the path segment **exactly** — the check is
-   case-sensitive and does a plain string match, no trimming.
+2. Add a variable named `SIGNING_KEY`, type **Secret**, value of your choosing
+   (a long random string — this is a signing key, not something typed into a
+   URL, so it doesn't need to be memorable).
 3. Save — and if prompted, redeploy.
 
-Your speed-test URL is then:
+Anything not matching a currently-valid signature + expiry returns `404`.
+Unlike the plain-secret approach, **you never type or reuse this key in a
+URL** — you generate a fresh signed URL per test instead (next section).
+
+## Generating a test URL
+
+Use [`scripts/gen-url.sh`](scripts/gen-url.sh) to produce a URL valid for the
+next 10 minutes (default; pass a different TTL in seconds as the second
+argument):
+```bash
+SPEEDTEST_SIGNING_KEY="<same value as the Worker's SIGNING_KEY secret>" \
+  ./scripts/gen-url.sh <your-worker-subdomain-or-custom-domain> 600
 ```
-https://<your-worker-subdomain-or-custom-domain>/<your-secret>
-```
-Any request whose first path segment doesn't match returns `404`. Anything
-after that first segment is ignored by the Worker, so `/<your-secret>/down`,
-`/<your-secret>/anything`, or the bare `/<your-secret>` all behave identically
-— add a trailing label only if you want the URL to read more clearly.
+This prints a complete URL, e.g. `https://speedtest.example.com/1790416074-3f9c…`
+— the leading number is the expiry (unix time), the rest is an HMAC-SHA256
+signature over it. Anyone who captures one of these URLs only gets a window
+until it expires; it can't be reused or extended without your `SIGNING_KEY`.
 
 ## Use it with CloudflareSpeedTest
 
+Generate a URL right before you run the test (see above), then:
 ```bash
-CloudflareSpeedTest -url "https://<your-worker-subdomain-or-custom-domain>/<your-secret>" -debug
+CloudflareSpeedTest -url "$(SPEEDTEST_SIGNING_KEY="..." ./scripts/gen-url.sh <your-domain> 600)" -debug
 ```
+If the test run (ping phase + download phase) might take longer than the
+default 10-minute window, pass a larger TTL as the second argument.
 
 ## Optional: fixed-size test files, for manual spot-checks only
 
@@ -51,14 +65,14 @@ Append a size as a second path segment — `50m.test`, `100m.test`, `1g.test`
 (`k`/`m`/`g`, decimals allowed, `.test` optional) — to get back exactly that
 many bytes with a real `Content-Length`, instead of the endless stream:
 ```bash
-curl -o /dev/null -w '%{http_code} %{size_download} bytes\n' \
-  "https://<your-domain>/<your-secret>/50m.test"
+TOKEN=$(SPEEDTEST_SIGNING_KEY="..." ./scripts/gen-url.sh <your-domain> 600)
+curl -o /dev/null -w '%{http_code} %{size_download} bytes\n' "${TOKEN}/50m.test"
 ```
 **Don't point CloudflareSpeedTest's `-url` at a sized variant.** If the
 requested size is small enough that a fast connection finishes downloading it
 before your `-dt` timeout elapses, the transfer ends on its own — and
 `download.go`'s throughput sampler is specifically not designed to handle that
-correctly (see below). Use the bare secret path (unbounded) for the actual
+correctly (see below). Use the bare token path (unbounded) for the actual
 tool; use sized paths only for your own `curl`/browser verification.
 
 ## Built-in safety cap
@@ -68,31 +82,46 @@ of client behavior (`MAX_DURATION_MS` in `src/index.js`) — a backstop against
 a stuck or abusive connection, well above any realistic `-dt` value. Adjust
 the constant if you routinely run much longer tests.
 
-## Hardening beyond the secret path
+## Hardening beyond the signed token
 
-A secret path only stops people who don't know it — it's not a hard deny. For
-real access control:
+A signed, expiring token is already a meaningfully stronger position than a
+static secret path — but it's not a hard deny either (nothing stops someone
+from replaying a captured URL until it expires). For real access control:
 
 - **Custom domain + WAF rule.** Attach the Worker to a domain you own
   (Workers & Pages → your worker → Settings → Domains & Routes → Add Custom
   Domain), then add a WAF custom rule (Security → WAF → Custom rules) blocking
-  everything except your own IP on that path, e.g.:
+  everything except your own IP on that hostname, e.g.:
   ```
-  (http.request.uri.path contains "/<your-secret>/") and not ip.src in {203.0.113.10}
+  (http.host eq "speedtest.example.com") and not ip.src in {203.0.113.10}
   ```
-- **Rate limiting rule** on the same route as a backstop even if the secret leaks.
+  Since the path itself is no longer a fixed string to match against, scoping
+  by hostname (rather than a path substring) is simpler and still correct —
+  nothing on this hostname ever returns anything but `404` without a valid
+  signature anyway.
+- **Rate limiting rule** on the same route as a backstop even if a URL leaks
+  during its validity window.
 
 ## Troubleshooting
 
-- **Getting `0` speed:** confirm you're hitting the bare secret path, not a
+- **Getting `0` speed:** confirm you're hitting the bare token path, not a
   sized variant small enough to finish before `-dt` elapses (see above).
+- **`404` even with a URL you just generated:** the most common cause is the
+  script's `SPEEDTEST_SIGNING_KEY` not matching the Worker's `SIGNING_KEY`
+  secret exactly (whitespace, wrong value re-pasted, or it was rotated on one
+  side but not the other). Since Cloudflare never lets you read a secret's
+  value back, if in doubt just set a brand-new value on both sides together.
+- **`404` on a URL that worked a minute ago:** check the TTL you generated it
+  with — the default is 10 minutes; pass a longer TTL as `gen-url.sh`'s second
+  argument if a full ping+download run needs more time than that.
 - **`curl` gets `404` but the dashboard's code-editor preview returns `200`
-  for the same path:** the preview pane and your Worker's real, deployed
-  **Settings → Variables and Secrets** value can differ. Re-enter
-  `SPEEDTEST_SECRET` there (case-sensitive, no stray whitespace) rather than
-  trusting the editor preview alone.
+  for what looks like the same token:** the preview pane and the Worker's
+  real, deployed `SIGNING_KEY` secret can differ, and a token you typed
+  manually into the preview a few minutes ago may simply have expired by the
+  time you check it in a real request. Generate a fresh one and retest rather
+  than reusing an old value in either place.
 - **`curl` body is literally the text `Not found`:** your request *is*
-  reaching this Worker — it's a secret mismatch (see above), not a
+  reaching this Worker — it's an invalid or expired token (see above), not a
   routing/DNS problem.
 - **`curl` body is something else (HTML, empty, a Cloudflare-branded error
   page):** the request likely never reached this Worker at all — check that
@@ -165,9 +194,10 @@ test process bypasses the proxy, leaving everything else on the router
    error, since it's inserted inside fw4's own table), so it survives reboots
    and proxy service restarts without depending on their dynamically-generated
    chain names.
-4. **Run the test as that user:**
+4. **Run the test as that user**, generating a fresh signed URL first:
    ```sh
-   su speedtest -c "CloudflareSpeedTest -url \"https://<your-domain>/<your-secret>\" -debug"
+   URL=$(SPEEDTEST_SIGNING_KEY="..." ./scripts/gen-url.sh <your-domain> 600)
+   su speedtest -c "CloudflareSpeedTest -url \"$URL\" -debug"
    ```
 5. **Verify it's actually bypassing** — compare egress (e.g. `curl
    https://cloudflare.com/cdn-cgi/trace`) as the `speedtest` user vs. as
@@ -183,7 +213,7 @@ installed) rather than an nftables mark.
 ```bash
 npm install -g wrangler
 wrangler login
-wrangler secret put SPEEDTEST_SECRET   # enter your secret value when prompted
+wrangler secret put SIGNING_KEY   # enter a long random value when prompted
 wrangler deploy
 ```
 
