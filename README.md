@@ -38,10 +38,18 @@ URL** — you generate a fresh signed URL per test instead (next section).
 
 ## Generating a test URL
 
-Use [`scripts/gen-url.sh`](scripts/gen-url.sh) to produce a URL valid for the
-next 10 minutes (default; pass a different TTL in seconds as the second
-argument):
-```bash
+[`scripts/gen-url.sh`](scripts/gen-url.sh) is plain POSIX `sh` (no bashisms —
+it runs fine under BusyBox `ash`, so it works as-is on an OpenWrt router, not
+just a regular Linux/macOS shell). It needs the `openssl` CLI, which on
+OpenWrt is **not** installed by default — even if Passwall/Xray-core is
+running, they don't expose a shell-usable `openssl` binary:
+```sh
+opkg update && opkg install openssl-util
+```
+
+Then generate a URL valid for the next 10 minutes (default; pass a different
+TTL in seconds as the second argument):
+```sh
 SPEEDTEST_SIGNING_KEY="<same value as the Worker's SIGNING_KEY secret>" \
   ./scripts/gen-url.sh <your-worker-subdomain-or-custom-domain> 600
 ```
