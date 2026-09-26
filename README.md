@@ -226,6 +226,83 @@ same UID-matching principle still applies — you'd instead need a competing,
 higher-precedence `ip rule` (`ip rule list` to see what your proxy already
 installed) rather than an nftables mark.
 
+## Alternative: VPS + nginx origin (instead of a Worker)
+
+The Worker measures "path to whichever Cloudflare edge answers" — exactly
+what CloudflareSpeedTest is designed to find, but not quite what you get
+browsing a real Cloudflare-fronted website, which adds a second leg: edge →
+Cloudflare's backbone → the actual origin server. Putting your own VPS behind
+Cloudflare reproduces that second leg, so the numbers reflect a more
+realistic "path to a Cloudflare-proxied site whose origin is roughly where
+your VPS is."
+
+**Architecture:** same IP-pinning mechanism as the Worker (`download.go`'s
+`DialContext` override) — CloudflareSpeedTest dials arbitrary Cloudflare edge
+IPs with SNI set to your domain; the edge then proxies to your VPS instead of
+answering directly.
+
+**Critical gotcha:** if Cloudflare caches the payload at the edge after the
+first fetch, every later request is served from cache — collapsing back into
+"edge-only" with no obvious symptom. Add a **Cache Rule: Bypass** for this
+path, and/or have nginx send `Cache-Control: no-store`.
+
+### Cloudflare-side setup
+1. **DNS**: proxied (orange cloud) `A`/`AAAA` record → your VPS IP.
+2. **SSL/TLS**: **Full (strict)**, using a Cloudflare **Origin CA certificate**
+   installed on the VPS.
+3. **Cache Rule**: bypass cache for the test path (above).
+
+### VPS-side setup
+1. **Create the payload file**, sized well above what any realistic
+   connection finishes within your `-dt` window (it's a real file with a
+   real `Content-Length`, unlike the Worker's endless stream — the same
+   "finished early → false low/zero speed" risk applies if it's too small):
+   ```sh
+   fallocate -l 20G /usr/share/nginx/html/speedtest/payload.bin   # fast; falls back to dd-speed on unsupported filesystems
+   # or: dd if=/dev/zero of=/usr/share/nginx/html/speedtest/payload.bin bs=1G count=20 status=progress
+   ```
+2. **nginx config**: [`nginx/speedtest.conf`](nginx/speedtest.conf) —
+   time-limited, signed-link access via nginx's built-in
+   `ngx_http_secure_link_module` (MD5-based, not the Worker's HMAC-SHA256 —
+   vanilla nginx doesn't ship a SHA-256 variant without extra modules; for
+   gating a personal endpoint this is adequate). Paste it into your `server {}`
+   block, set your own secret in place of `my-shared-secret-here`, then:
+   ```sh
+   nginx -t && systemctl reload nginx
+   ```
+3. **Firewall**: restrict port 443 to Cloudflare's published IP ranges
+   (`https://www.cloudflare.com/ips-v4` / `-v6`) — otherwise your origin's
+   real IP is a bypass path around all of this.
+4. **Bandwidth**: unlike the Worker (Cloudflare absorbs the compute, no
+   bandwidth billing), every test byte here transits your VPS's own network
+   port — check your provider's egress allowance before running large or
+   repeated tests.
+
+### Generating a signed URL
+
+[`scripts/gen-url-nginx.sh`](scripts/gen-url-nginx.sh) — same idea as the
+Worker's `gen-url.sh` (POSIX `sh`, works under OpenWrt), different encoding
+to match nginx's `secure_link` expectations:
+```sh
+NGINX_SECURE_LINK_SECRET="my-shared-secret-here" \
+  ./scripts/gen-url-nginx.sh vps.example.com /speedtest/payload.bin
+```
+Defaults to a 60-minute window; pass a third argument to override. The URI
+argument must exactly match nginx's `$uri` for that request — it's part of
+what gets hashed.
+
+```bash
+CloudflareSpeedTest -url "$(NGINX_SECURE_LINK_SECRET="..." ./scripts/gen-url-nginx.sh vps.example.com /speedtest/payload.bin)" -debug
+```
+
+**One gap versus the Worker:** the Worker independently caps token TTL at 120
+minutes regardless of signature validity (`MAX_TTL_SECONDS` in `src/index.js`).
+Vanilla nginx config directives can't express that same "reject if requested
+window exceeds N minutes" check — it's declarative, not a general-purpose
+language — so the TTL here is purely a client-side convention, same as the
+Worker was before that cap was added. Achieving parity would need nginx's
+`njs` module or OpenResty/Lua.
+
 ## Local development (optional, instead of the button)
 
 ```bash
