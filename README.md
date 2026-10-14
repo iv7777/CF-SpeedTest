@@ -303,6 +303,47 @@ language — so the TTL here is purely a client-side convention, same as the
 Worker was before that cap was added. Achieving parity would need nginx's
 `njs` module or OpenResty/Lua.
 
+## Alternative: Cloudflare Pages (second independent endpoint)
+
+A second, independent deployment of the same logic on Cloudflare Pages
+rather than a standalone Worker — useful as a redundant endpoint, or because
+Pages' custom-domain flow accepts a domain registered at **any** DNS
+provider (it validates ownership and issues its own certificate), whereas
+Workers' Custom Domains feature requires the domain to be an active zone on
+the same Cloudflare account.
+
+**Pages will not run a plain `index.js` the way a Worker does.** It's
+primarily a static-site host; dynamic behavior needs one of two specific
+conventions:
+- a `functions/` directory using file-based routing with `onRequest`-style
+  exports, or
+- **`_worker.js`** (exact filename, underscore prefix, at the deployment
+  root) — "Advanced Mode," the one case where Pages behaves exactly like a
+  Worker and intercepts every request using the same `export default { fetch }`
+  signature.
+
+[`pages/_worker.js`](pages/_worker.js) is the second option — identical logic
+to `src/index.js`, just packaged under the filename Pages actually looks for.
+Deploy it (dashboard "Upload assets" pointed at the `pages/` directory, or
+`wrangler pages deploy pages/`), then under that Pages project's **Settings →
+Environment variables**, set `SIGNING_KEY` — this is a separate secret store
+from the standalone Worker's, even though the code is the same.
+
+**A bare DNS `CNAME` at `*.pages.dev` is not sufficient on its own** — this
+is almost certainly why an earlier attempt didn't work even after fixing the
+`_worker.js` naming. The domain still has to be added through **that Pages
+project's own "Custom domains" tab** in the dashboard; only then does
+Cloudflare's edge know to route that hostname into this project and
+provision a certificate for it. The domain's DNS can live at any registrar —
+it doesn't need to be a Cloudflare zone — but the registration step in the
+Pages dashboard is still required regardless of where DNS is hosted.
+
+Once both are in place, use it exactly like the Worker, with `scripts/gen-url.sh`
+pointed at the Pages custom domain instead:
+```bash
+CloudflareSpeedTest -url "$(SPEEDTEST_SIGNING_KEY="..." ./scripts/gen-url.sh <your-pages-custom-domain> 600)" -debug
+```
+
 ## Local development (optional, instead of the button)
 
 ```bash
