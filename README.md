@@ -93,6 +93,29 @@ before your `-dt` timeout elapses, the transfer ends on its own — and
 correctly (see below). Use the bare token path (unbounded) for the actual
 tool; use sized paths only for your own `curl`/browser verification.
 
+## Range requests
+
+The Worker honours a single-range `Range: bytes=…` header and answers `206 Partial
+Content` with a real `Content-Length` and `Content-Range`, so a health check can
+ask for a few bytes and get a complete, immediate response instead of having to
+cut the endless stream off itself:
+```bash
+curl -s -o /dev/null -w '%{http_code} %{size_download} bytes\n' --range 0-1024 "${TOKEN}"
+# 206 1025 bytes   (Content-Range: bytes 0-1024/*)
+```
+- **Bare token path (endless stream):** only a closed range (`bytes=S-E`) is
+  honoured, with `Content-Range: bytes S-E/*` (the total length is unknown).
+  `bytes=S-` and `bytes=-N` need an end that doesn't exist, so they are ignored.
+- **Sized files (`50m.test` etc.):** `bytes=S-E`, `bytes=S-` and `bytes=-N` all
+  work; the end is clamped to the file size, and a range outside it gets
+  `416` with `Content-Range: bytes */<size>`.
+- **Everything else is ignored and answered with the usual `200`:** multiple
+  ranges, malformed values, and any request carrying `If-Range` (there is no
+  validator to match).
+- **CloudflareSpeedTest is unaffected.** It sends a plain GET, which still gets
+  the endless `200` stream with no `Content-Length`.
+- `HEAD` with a `Range` header returns the `206` headers with no body.
+
 ## Built-in safety cap
 
 Each connection is force-closed after 5 minutes of wall-clock time regardless
@@ -359,5 +382,6 @@ wrangler deploy
 only avoids a false "0 speed" result if the transfer never reaches EOF on its
 own — it should only ever be cut off by the client's own `-dt` timeout (or the
 5-minute safety cap above). That's why the unbounded path has no
-`Content-Length` and never closes itself; see the `pull()` callback in
+`Content-Length` and never closes itself (unless a client asks for a closed
+range, see above); see the `pull()` callback in
 [`src/index.js`](src/index.js).

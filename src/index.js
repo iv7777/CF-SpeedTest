@@ -34,6 +34,39 @@ async function verifyToken(token, key) {
   );
 }
 
+// Parses a single-range "Range: bytes=..." request header. size is the
+// resource's fixed size in bytes (the sized test files), or null for the
+// endless stream. Returns:
+//   { start, end }   a satisfiable range (end inclusive)
+//   "unsatisfiable"  well-formed but outside the resource -> answer 416
+//   null             absent, malformed, multi-range, or not honourable for
+//                    this resource -> ignore the header and answer 200
+// The endless stream has no end, so it only honours a closed range
+// ("bytes=0-1024"); "to the end" and "last N bytes" are ignored there.
+function parseRange(header, size) {
+  const m = /^bytes=(\d*)-(\d*)$/i.exec((header || "").trim());
+  if (!m || (m[1] === "" && m[2] === "") || size === 0) return null;
+  const first = m[1] === "" ? null : parseInt(m[1], 10);
+  const last = m[2] === "" ? null : parseInt(m[2], 10);
+  if ((first !== null && !Number.isSafeInteger(first)) || (last !== null && !Number.isSafeInteger(last))) {
+    return null;
+  }
+
+  if (first === null) { // suffix: the last N bytes
+    if (size === null) return null;
+    if (last === 0) return "unsatisfiable";
+    return { start: Math.max(0, size - last), end: size - 1 };
+  }
+  if (last === null) { // open-ended: from first to the end
+    if (size === null) return null;
+    return first >= size ? "unsatisfiable" : { start: first, end: size - 1 };
+  }
+  if (last < first) return null; // invalid -> ignore
+  if (size === null) return { start: first, end: last };
+  if (first >= size) return "unsatisfiable";
+  return { start: first, end: Math.min(last, size - 1) };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -59,32 +92,53 @@ export default {
       sizeBytes = Math.round(n * mult);
     }
 
+    // Range support (RFC 9110): a request for part of the resource gets a 206.
+    // The test files are generated, so a range is just a shorter stream; the
+    // endless stream honours closed ranges only (see parseRange). Plain GETs
+    // — which is what CloudflareSpeedTest sends — are unaffected. If-Range is
+    // ignored along with the Range header: there is no validator to match, so
+    // the full 200 response is the correct answer to it.
+    const range = request.headers.has("If-Range") ? null : parseRange(request.headers.get("Range"), sizeBytes);
+    if (range === "unsatisfiable") {
+      return new Response(null, {
+        status: 416,
+        headers: { "Content-Range": `bytes */${sizeBytes}`, "Accept-Ranges": "bytes" },
+      });
+    }
+
+    const headers = { "Content-Type": "application/octet-stream", "Accept-Ranges": "bytes" };
+    let status = 200;
+    let limit = sizeBytes; // bytes to send; null = endless stream
+    if (range) {
+      status = 206;
+      limit = range.end - range.start + 1;
+      headers["Content-Range"] = `bytes ${range.start}-${range.end}/${sizeBytes ?? "*"}`;
+    }
+    if (limit !== null) {
+      headers["Content-Length"] = String(limit); // only set for a fixed size or a range — otherwise
+    }                                             // chunked transfer, contentLength == -1 in download.go
+
     const MAX_DURATION_MS = 5 * 60 * 1000; // safety valve for a stuck/abusive connection — well above any sane -dt
     const started = Date.now();
     const chunk = new Uint8Array(64 * 1024);
     let sent = 0;
     const stream = new ReadableStream({
       pull(controller) {
-        if (sizeBytes !== null && sent >= sizeBytes) {
+        if (limit !== null && sent >= limit) {
           return controller.close();
         }
         if (Date.now() - started > MAX_DURATION_MS) {
           return controller.close();
         }
-        const n = sizeBytes !== null ? Math.min(chunk.byteLength, sizeBytes - sent) : chunk.byteLength;
+        const n = limit !== null ? Math.min(chunk.byteLength, limit - sent) : chunk.byteLength;
         const piece = n === chunk.byteLength ? chunk : chunk.subarray(0, n);
         controller.enqueue(piece);
         sent += n;
       },
     });
 
-    const headers = { "Content-Type": "application/octet-stream" };
-    if (sizeBytes !== null) {
-      headers["Content-Length"] = String(sizeBytes); // only set when a fixed size was requested — otherwise
-    }                                                  // chunked transfer, contentLength == -1 in download.go
-
     return new Response(request.method === "HEAD" ? null : stream, {
-      status: 200,
+      status,
       headers,
     });
   },
